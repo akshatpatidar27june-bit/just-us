@@ -15,12 +15,13 @@ function Chat({ role, onBack }: { role: Role; onBack: () => void }) {
   const [error, setError] = useState('');
   const [online, setOnline] = useState(false);
   const bottomRef = useRef<HTMLDivElement>(null);
+  const inputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
     let alive = true;
     let channel: ReturnType<typeof supabase.channel> | null = null;
     async function initialize() {
-      const { data: room, error: roomError } = await supabase.from('rooms').select('id').limit(1).single();
+      const { data: room, error: roomError } = await supabase.from('rooms').select('id').limit(1).maybeSingle();
       if (!alive) return;
       if (roomError || !room) { setError(roomError?.message ?? 'Chat room unavailable.'); setLoading(false); return; }
       setRoomId(room.id);
@@ -39,7 +40,7 @@ function Chat({ role, onBack }: { role: Role; onBack: () => void }) {
         } else if (payload.eventType === 'DELETE') {
           setMessages((current) => current.filter((item) => item.id !== payload.old.id));
         }
-      }).subscribe((status) => { if (alive) setOnline(status === 'SUBSCRIBED'); });
+      }).subscribe((status) => { if (alive) { setOnline(status === 'SUBSCRIBED'); if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT') setError('Realtime connection unavailable.'); } });
     }
     void initialize();
     return () => { alive = false; setOnline(false); if (channel) void supabase.removeChannel(channel); };
@@ -64,17 +65,18 @@ function Chat({ role, onBack }: { role: Role; onBack: () => void }) {
       const message = data as Message;
       setMessages((current) => current.some((item) => item.id === message.id) ? current : [...current, message]);
       setText('');
+      requestAnimationFrame(() => inputRef.current?.focus());
     }
     setSending(false);
   }
 
   return <main className="chat-page">
-    <header className="chat-header"><button type="button" onClick={onBack} aria-label="Back">←</button><div><b>💙 Just Us</b><small>{online ? '● Live' : '○ Connecting…'}</small></div></header>
+    <header className="chat-header"><button type="button" onClick={onBack} aria-label="Back">←</button><div><b>💙 Just Us</b><small>{online ? '● Live' : loading ? '○ Connecting…' : '○ Offline'}</small></div></header>
     <section className="messages" aria-live="polite">
       {loading ? <div>Opening your little corner…</div> : messages.length === 0 ? <div className="empty"><span>♡</span><strong>Nothing here yet</strong><span>Say hello. It can be anything.</span></div> : messages.map((message) => <article key={message.id} className={message.sender === role ? 'mine' : 'theirs'}><div className={`bubble ${message.sender}`}>{message.content}</div><time>{new Date(message.created_at).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}</time></article>)}
       <div ref={bottomRef} />
     </section>
-    <form onSubmit={send} className="composer"><input value={text} onChange={(event) => setText(event.target.value)} placeholder="Write something…" maxLength={4000} disabled={loading} aria-label="Message"/><button type="submit" disabled={!text.trim() || sending || !roomId} aria-label="Send message">{sending ? '…' : '↑'}</button></form>
+    <form onSubmit={send} className="composer"><input ref={inputRef} value={text} onChange={(event) => setText(event.target.value)} onKeyDown={(event) => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); void send(); } }} placeholder={loading ? 'Write while we connect…' : 'Write something…'} maxLength={4000} aria-label="Message" autoComplete="off" autoFocus/><button type="submit" disabled={!text.trim() || sending || !roomId} aria-label="Send message">{sending ? '…' : '↑'}</button></form>
     {error && <div className="error">{error}</div>}
   </main>;
 }
@@ -84,7 +86,7 @@ export default function Home() {
   const [counts, setCounts] = useState({ her: 0, him: 0 });
   useEffect(() => {
     async function loadUnreadCounts() {
-      const { data: room } = await supabase.from('rooms').select('id').limit(1).single();
+      const { data: room } = await supabase.from('rooms').select('id').limit(1).maybeSingle();
       if (!room) return;
       const { data: rows } = await supabase.from('messages').select('sender,her_seen,him_seen').eq('room_id', room.id);
       if (!rows) return;
