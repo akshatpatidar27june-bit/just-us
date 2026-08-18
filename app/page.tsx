@@ -6,6 +6,21 @@ import { isSupabaseConfigured, supabase } from '../supabase/client';
 type Role = 'her' | 'him';
 type Message = { id: string; room_id: string; sender: Role; content: string; her_seen: boolean; him_seen: boolean; created_at: string };
 
+async function getRoomId() {
+  const { data, error } = await supabase.from('rooms').select('id').order('created_at', { ascending: true }).limit(1).maybeSingle();
+  if (error) throw error;
+  return data?.id ?? null;
+}
+
+async function getUnreadCounts(roomId: string) {
+  const { data, error } = await supabase.from('messages').select('sender,her_seen,him_seen').eq('room_id', roomId);
+  if (error) throw error;
+  return {
+    her: (data ?? []).filter((row) => row.sender === 'him' && !row.her_seen).length,
+    him: (data ?? []).filter((row) => row.sender === 'her' && !row.him_seen).length,
+  };
+}
+
 function Chat({ role, onBack }: { role: Role; onBack: () => void }) {
   const [roomId, setRoomId] = useState<string | null>(null);
   const [messages, setMessages] = useState<Message[]>([]);
@@ -16,6 +31,11 @@ function Chat({ role, onBack }: { role: Role; onBack: () => void }) {
   const [online, setOnline] = useState(false);
   const bottomRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
+
+  async function refreshMessages(id: string) {
+    const { data, error: refreshError } = await supabase.from('messages').select('*').eq('room_id', id).order('created_at', { ascending: true });
+    if (!refreshError) setMessages((data ?? []) as Message[]);
+  }
 
   useEffect(() => {
     let alive = true;
@@ -30,38 +50,43 @@ function Chat({ role, onBack }: { role: Role; onBack: () => void }) {
         return;
       }
 
-      const { data: room, error: roomError } = await supabase.from('rooms').select('id').order('created_at', { ascending: true }).limit(1).maybeSingle();
-      if (!alive) return;
-      if (roomError || !room) {
-        setError(roomError?.message ?? 'The Just Us chat room was not found. Run the Supabase migration first.');
+      try {
+        const id = await getRoomId();
+        if (!alive) return;
+        if (!id) {
+          setError('The Just Us chat room was not found. Run the Supabase migration first.');
+          setLoading(false);
+          return;
+        }
+
+        setRoomId(id);
+        const { data, error: messagesError } = await supabase.from('messages').select('*').eq('room_id', id).order('created_at', { ascending: true });
+        if (!alive) return;
+        if (messagesError) setError(messagesError.message); else setMessages((data ?? []) as Message[]);
         setLoading(false);
-        return;
+
+        channel = supabase.channel(`just-us-${id}`)
+          .on('postgres_changes', { event: '*', schema: 'public', table: 'messages', filter: `room_id=eq.${id}` }, (payload) => {
+            if (!alive) return;
+            if (payload.eventType === 'INSERT') {
+              const message = payload.new as Message;
+              setMessages((current) => current.some((item) => item.id === message.id) ? current : [...current, message]);
+            } else if (payload.eventType === 'UPDATE') {
+              const message = payload.new as Message;
+              setMessages((current) => current.map((item) => item.id === message.id ? message : item));
+            } else if (payload.eventType === 'DELETE') {
+              setMessages((current) => current.filter((item) => item.id !== payload.old.id));
+            }
+          })
+          .subscribe((status) => {
+            if (!alive) return;
+            setOnline(status === 'SUBSCRIBED');
+            if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT') setError('Realtime connection unavailable.');
+          });
+      } catch (caught) {
+        if (alive) setError(caught instanceof Error ? caught.message : 'Unable to open the chat.');
+        setLoading(false);
       }
-
-      setRoomId(room.id);
-      const { data, error: messagesError } = await supabase.from('messages').select('*').eq('room_id', room.id).order('created_at', { ascending: true });
-      if (!alive) return;
-      if (messagesError) setError(messagesError.message); else setMessages((data ?? []) as Message[]);
-      setLoading(false);
-
-      channel = supabase.channel(`just-us-${room.id}`)
-        .on('postgres_changes', { event: '*', schema: 'public', table: 'messages', filter: `room_id=eq.${room.id}` }, (payload) => {
-          if (!alive) return;
-          if (payload.eventType === 'INSERT') {
-            const message = payload.new as Message;
-            setMessages((current) => current.some((item) => item.id === message.id) ? current : [...current, message]);
-          } else if (payload.eventType === 'UPDATE') {
-            const message = payload.new as Message;
-            setMessages((current) => current.map((item) => item.id === message.id ? message : item));
-          } else if (payload.eventType === 'DELETE') {
-            setMessages((current) => current.filter((item) => item.id !== payload.old.id));
-          }
-        })
-        .subscribe((status) => {
-          if (!alive) return;
-          setOnline(status === 'SUBSCRIBED');
-          if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT') setError('Realtime connection unavailable.');
-        });
     }
 
     void initialize();
@@ -73,7 +98,23 @@ function Chat({ role, onBack }: { role: Role; onBack: () => void }) {
   useEffect(() => {
     if (!roomId || !messages.length) return;
     const unseenIds = messages.filter((message) => message.sender !== role).filter((message) => role === 'her' ? !message.her_seen : !message.him_seen).map((message) => message.id);
-    if (unseenIds.length) void supabase.rpc('mark_seen', { p_message_ids: unseenIds, p_viewer: role });
+    if (!unseenIds.length) return;
+
+    let cancelled = false;
+    async function markAndRefresh() {
+      const { error: seenError } = await supabase.rpc('mark_seen', { p_message_ids: unseenIds, p_viewer: role });
+      if (cancelled) return;
+      if (seenError) {
+        setError(`Seen update failed: ${seenError.message}`);
+        return;
+      }
+      // The database trigger can permanently remove a message as soon as both
+      // people have seen it. Re-read the room so the UI and unread state never
+      // depend on a realtime DELETE event arriving in a particular order.
+      await refreshMessages(roomId);
+    }
+    void markAndRefresh();
+    return () => { cancelled = true; };
   }, [messages, role, roomId]);
 
   async function send(event?: FormEvent<HTMLFormElement>) {
@@ -122,15 +163,30 @@ export default function Home() {
   const [counts, setCounts] = useState({ her: 0, him: 0 });
 
   useEffect(() => {
+    let alive = true;
+    let channel: ReturnType<typeof supabase.channel> | null = null;
+
     async function loadUnreadCounts() {
       if (!isSupabaseConfigured()) return;
-      const { data: room } = await supabase.from('rooms').select('id').order('created_at', { ascending: true }).limit(1).maybeSingle();
-      if (!room) return;
-      const { data: rows } = await supabase.from('messages').select('sender,her_seen,him_seen').eq('room_id', room.id);
-      if (!rows) return;
-      setCounts({ her: rows.filter((row) => row.sender === 'him' && !row.her_seen).length, him: rows.filter((row) => row.sender === 'her' && !row.him_seen).length });
+      try {
+        const roomId = await getRoomId();
+        if (!roomId || !alive) return;
+        const next = await getUnreadCounts(roomId);
+        if (alive) setCounts(next);
+
+        channel = supabase.channel(`just-us-unread-${roomId}`)
+          .on('postgres_changes', { event: '*', schema: 'public', table: 'messages', filter: `room_id=eq.${roomId}` }, async () => {
+            try {
+              const latest = await getUnreadCounts(roomId);
+              if (alive) setCounts(latest);
+            } catch { /* Chat view shows operational errors; badge refresh is best-effort. */ }
+          })
+          .subscribe();
+      } catch { /* The entry screen stays usable if Supabase is temporarily unavailable. */ }
     }
+
     void loadUnreadCounts();
+    return () => { alive = false; if (channel) void supabase.removeChannel(channel); };
   }, [role]);
 
   if (role) return <Chat role={role} onBack={() => setRole(null)} />;
