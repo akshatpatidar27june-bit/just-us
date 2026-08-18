@@ -65,7 +65,8 @@ function Chat({ role, onBack }: { role: Role; onBack: () => void }) {
   useEffect(() => { bottomRef.current?.scrollIntoView({ behavior: 'smooth' }); }, [messages]);
 
   useEffect(() => {
-    if (!roomId || !messages.length) return;
+    const id = roomId;
+    if (!id || !messages.length) return;
     const unseenIds = messages.filter((m) => m.sender !== role && (role === 'her' ? !m.her_seen : !m.him_seen)).map((m) => m.id);
     if (!unseenIds.length) return;
     let cancelled = false;
@@ -73,7 +74,7 @@ function Chat({ role, onBack }: { role: Role; onBack: () => void }) {
       const { error: seenError } = await supabase.rpc('mark_seen', { p_message_ids: unseenIds, p_viewer: role });
       if (cancelled) return;
       if (seenError) { setError(`Seen update failed: ${seenError.message}`); return; }
-      await refreshMessages(roomId);
+      await refreshMessages(id);
     }
     void markAndRefresh();
     return () => { cancelled = true; };
@@ -90,8 +91,9 @@ function Chat({ role, onBack }: { role: Role; onBack: () => void }) {
 
   async function deleteMessage(id: string) {
     if (!window.confirm('Delete this message?')) return;
+    if (!roomId) return;
     setError('');
-    const { error: deleteError } = await supabase.from('messages').delete().eq('id', id).eq('room_id', roomId ?? '');
+    const { error: deleteError } = await supabase.from('messages').delete().eq('id', id).eq('room_id', roomId);
     if (deleteError) setError(`Delete failed: ${deleteError.message}`); else setMessages((c) => c.filter((m) => m.id !== id));
   }
 
