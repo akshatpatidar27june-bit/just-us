@@ -46,6 +46,12 @@ function Chat({ role, onBack }: { role: Role; onBack: () => void }) {
         if (!alive) return;
         if (typeof id !== 'string') { setError('The Just Us chat room was not found.'); setLoading(false); return; }
         setRoomId(id);
+
+        // Messages that were already seen by both people are removed only when
+        // the chat is opened again, not immediately after the first view.
+        const { error: cleanupError } = await supabase.rpc('cleanup_seen_messages', { p_room_id: id });
+        if (cleanupError) throw cleanupError;
+
         const { data, error: messagesError } = await supabase.from('messages').select('*').eq('room_id', id).order('created_at', { ascending: true });
         if (!alive) return;
         if (messagesError) setError(messagesError.message); else setMessages((data ?? []) as Message[]);
