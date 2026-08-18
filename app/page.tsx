@@ -82,26 +82,29 @@ function Chat({ role, onBack }: { role: Role; onBack: () => void }) {
 
   async function send(event?: FormEvent<HTMLFormElement>) {
     event?.preventDefault(); const content = text.trim(); if (!content || sending) return;
-    if (!roomId) { setError('Chat is still connecting.'); return; }
+    const id = roomId;
+    if (!id) { setError('Chat is still connecting.'); return; }
     setSending(true); setError('');
-    const { data, error: sendError } = await supabase.from('messages').insert({ room_id: roomId, sender: role, content, her_seen: role === 'her', him_seen: role === 'him' }).select('*').single();
+    const { data, error: sendError } = await supabase.from('messages').insert({ room_id: id, sender: role, content, her_seen: role === 'her', him_seen: role === 'him' }).select('*').single();
     if (sendError) setError(`Message failed: ${sendError.message}`); else if (data) { const m = data as Message; setMessages((c) => c.some((x) => x.id === m.id) ? c : [...c, m]); setText(''); requestAnimationFrame(() => inputRef.current?.focus()); }
     setSending(false);
   }
 
   async function deleteMessage(id: string) {
     if (!window.confirm('Delete this message?')) return;
-    if (!roomId) return;
+    const currentRoomId = roomId;
+    if (!currentRoomId) { setError('Chat is still connecting.'); return; }
     setError('');
-    const { error: deleteError } = await supabase.from('messages').delete().eq('id', id).eq('room_id', roomId);
+    const { error: deleteError } = await supabase.from('messages').delete().eq('id', id).eq('room_id', currentRoomId);
     if (deleteError) setError(`Delete failed: ${deleteError.message}`); else setMessages((c) => c.filter((m) => m.id !== id));
   }
 
   async function deleteChat() {
-    if (!roomId || deletingChat) return;
+    const currentRoomId = roomId;
+    if (!currentRoomId || deletingChat) return;
     if (!window.confirm('Delete the entire chat? This cannot be undone.')) return;
     setDeletingChat(true); setError('');
-    const { error: deleteError } = await supabase.from('messages').delete().eq('room_id', roomId);
+    const { error: deleteError } = await supabase.from('messages').delete().eq('room_id', currentRoomId);
     if (deleteError) setError(`Chat deletion failed: ${deleteError.message}`);
     else setMessages([]);
     setDeletingChat(false);
