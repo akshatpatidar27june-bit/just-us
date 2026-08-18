@@ -15,10 +15,7 @@ async function getRoomId() {
 async function getUnreadCounts(roomId: string) {
   const { data, error } = await supabase.from('messages').select('sender,her_seen,him_seen').eq('room_id', roomId);
   if (error) throw error;
-  return {
-    her: (data ?? []).filter((row) => row.sender === 'him' && !row.her_seen).length,
-    him: (data ?? []).filter((row) => row.sender === 'her' && !row.him_seen).length,
-  };
+  return { her: (data ?? []).filter((r) => r.sender === 'him' && !r.her_seen).length, him: (data ?? []).filter((r) => r.sender === 'her' && !r.him_seen).length };
 }
 
 function Chat({ role, onBack }: { role: Role; onBack: () => void }) {
@@ -29,6 +26,7 @@ function Chat({ role, onBack }: { role: Role; onBack: () => void }) {
   const [sending, setSending] = useState(false);
   const [error, setError] = useState('');
   const [online, setOnline] = useState(false);
+  const [deletingChat, setDeletingChat] = useState(false);
   const bottomRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
 
@@ -40,55 +38,26 @@ function Chat({ role, onBack }: { role: Role; onBack: () => void }) {
   useEffect(() => {
     let alive = true;
     let channel: ReturnType<typeof supabase.channel> | null = null;
-
     async function initialize() {
-      setLoading(true);
-      setError('');
-      if (!isSupabaseConfigured()) {
-        setError('Supabase is not configured. Add NEXT_PUBLIC_SUPABASE_URL and NEXT_PUBLIC_SUPABASE_ANON_KEY in Vercel.');
-        setLoading(false);
-        return;
-      }
-
+      setLoading(true); setError('');
+      if (!isSupabaseConfigured()) { setError('Supabase is not configured.'); setLoading(false); return; }
       try {
         const id = await getRoomId();
         if (!alive) return;
-        if (!id) {
-          setError('The Just Us chat room was not found. Run the Supabase migration first.');
-          setLoading(false);
-          return;
-        }
-
+        if (!id) { setError('The Just Us chat room was not found.'); setLoading(false); return; }
         setRoomId(id);
         const { data, error: messagesError } = await supabase.from('messages').select('*').eq('room_id', id).order('created_at', { ascending: true });
         if (!alive) return;
         if (messagesError) setError(messagesError.message); else setMessages((data ?? []) as Message[]);
         setLoading(false);
-
-        channel = supabase.channel(`just-us-${id}`)
-          .on('postgres_changes', { event: '*', schema: 'public', table: 'messages', filter: `room_id=eq.${id}` }, (payload) => {
-            if (!alive) return;
-            if (payload.eventType === 'INSERT') {
-              const message = payload.new as Message;
-              setMessages((current) => current.some((item) => item.id === message.id) ? current : [...current, message]);
-            } else if (payload.eventType === 'UPDATE') {
-              const message = payload.new as Message;
-              setMessages((current) => current.map((item) => item.id === message.id ? message : item));
-            } else if (payload.eventType === 'DELETE') {
-              setMessages((current) => current.filter((item) => item.id !== payload.old.id));
-            }
-          })
-          .subscribe((status) => {
-            if (!alive) return;
-            setOnline(status === 'SUBSCRIBED');
-            if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT') setError('Realtime connection unavailable.');
-          });
-      } catch (caught) {
-        if (alive) setError(caught instanceof Error ? caught.message : 'Unable to open the chat.');
-        setLoading(false);
-      }
+        channel = supabase.channel(`just-us-${id}`).on('postgres_changes', { event: '*', schema: 'public', table: 'messages', filter: `room_id=eq.${id}` }, (payload) => {
+          if (!alive) return;
+          if (payload.eventType === 'INSERT') { const m = payload.new as Message; setMessages((c) => c.some((x) => x.id === m.id) ? c : [...c, m]); }
+          else if (payload.eventType === 'UPDATE') { const m = payload.new as Message; setMessages((c) => c.map((x) => x.id === m.id ? m : x)); }
+          else if (payload.eventType === 'DELETE') setMessages((c) => c.filter((x) => x.id !== payload.old.id));
+        }).subscribe((status) => { if (!alive) return; setOnline(status === 'SUBSCRIBED'); if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT') setError('Realtime connection unavailable.'); });
+      } catch (caught) { if (alive) setError(caught instanceof Error ? caught.message : 'Unable to open the chat.'); setLoading(false); }
     }
-
     void initialize();
     return () => { alive = false; setOnline(false); if (channel) void supabase.removeChannel(channel); };
   }, []);
@@ -97,20 +66,13 @@ function Chat({ role, onBack }: { role: Role; onBack: () => void }) {
 
   useEffect(() => {
     if (!roomId || !messages.length) return;
-    const unseenIds = messages.filter((message) => message.sender !== role).filter((message) => role === 'her' ? !message.her_seen : !message.him_seen).map((message) => message.id);
+    const unseenIds = messages.filter((m) => m.sender !== role && (role === 'her' ? !m.her_seen : !m.him_seen)).map((m) => m.id);
     if (!unseenIds.length) return;
-
     let cancelled = false;
     async function markAndRefresh() {
       const { error: seenError } = await supabase.rpc('mark_seen', { p_message_ids: unseenIds, p_viewer: role });
       if (cancelled) return;
-      if (seenError) {
-        setError(`Seen update failed: ${seenError.message}`);
-        return;
-      }
-      // The database trigger can permanently remove a message as soon as both
-      // people have seen it. Re-read the room so the UI and unread state never
-      // depend on a realtime DELETE event arriving in a particular order.
+      if (seenError) { setError(`Seen update failed: ${seenError.message}`); return; }
       await refreshMessages(roomId);
     }
     void markAndRefresh();
@@ -118,39 +80,35 @@ function Chat({ role, onBack }: { role: Role; onBack: () => void }) {
   }, [messages, role, roomId]);
 
   async function send(event?: FormEvent<HTMLFormElement>) {
-    event?.preventDefault();
-    const content = text.trim();
-    if (!content || sending) return;
-    if (!roomId) {
-      setError('Chat is still connecting. If this stays here, check the Supabase environment variables in Vercel.');
-      return;
-    }
-
-    setSending(true);
-    setError('');
-    const { data, error: sendError } = await supabase.from('messages').insert({
-      room_id: roomId,
-      sender: role,
-      content,
-      her_seen: role === 'her',
-      him_seen: role === 'him',
-    }).select('*').single();
-
-    if (sendError) {
-      setError(`Message failed: ${sendError.message}`);
-    } else if (data) {
-      const message = data as Message;
-      setMessages((current) => current.some((item) => item.id === message.id) ? current : [...current, message]);
-      setText('');
-      requestAnimationFrame(() => inputRef.current?.focus());
-    }
+    event?.preventDefault(); const content = text.trim(); if (!content || sending) return;
+    if (!roomId) { setError('Chat is still connecting.'); return; }
+    setSending(true); setError('');
+    const { data, error: sendError } = await supabase.from('messages').insert({ room_id: roomId, sender: role, content, her_seen: role === 'her', him_seen: role === 'him' }).select('*').single();
+    if (sendError) setError(`Message failed: ${sendError.message}`); else if (data) { const m = data as Message; setMessages((c) => c.some((x) => x.id === m.id) ? c : [...c, m]); setText(''); requestAnimationFrame(() => inputRef.current?.focus()); }
     setSending(false);
   }
 
+  async function deleteMessage(id: string) {
+    if (!window.confirm('Delete this message?')) return;
+    setError('');
+    const { error: deleteError } = await supabase.from('messages').delete().eq('id', id).eq('room_id', roomId ?? '');
+    if (deleteError) setError(`Delete failed: ${deleteError.message}`); else setMessages((c) => c.filter((m) => m.id !== id));
+  }
+
+  async function deleteChat() {
+    if (!roomId || deletingChat) return;
+    if (!window.confirm('Delete the entire chat? This cannot be undone.')) return;
+    setDeletingChat(true); setError('');
+    const { error: deleteError } = await supabase.from('messages').delete().eq('room_id', roomId);
+    if (deleteError) setError(`Chat deletion failed: ${deleteError.message}`);
+    else setMessages([]);
+    setDeletingChat(false);
+  }
+
   return <main className="chat-page">
-    <header className="chat-header"><button type="button" onClick={onBack} aria-label="Back">←</button><div><b>💙 Just Us</b><small>{online ? '● Live' : loading ? '○ Connecting…' : '○ Offline'}</small></div></header>
+    <header className="chat-header"><button type="button" onClick={onBack} aria-label="Back">←</button><div><b>💙 Just Us</b><small>{online ? '● Live' : loading ? '○ Connecting…' : '○ Offline'}</small></div><button type="button" onClick={() => void deleteChat()} disabled={deletingChat || !roomId} aria-label="Delete entire chat" title="Delete entire chat">🗑️</button></header>
     <section className="messages" aria-live="polite">
-      {loading ? <div>Opening your little corner…</div> : messages.length === 0 ? <div className="empty"><span>♡</span><strong>Nothing here yet</strong><span>Say hello. It can be anything.</span></div> : messages.map((message) => <article key={message.id} className={message.sender === role ? 'mine' : 'theirs'}><div className={`bubble ${message.sender}`}>{message.content}</div><time>{new Date(message.created_at).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}</time></article>)}
+      {loading ? <div>Opening your little corner…</div> : messages.length === 0 ? <div className="empty"><span>♡</span><strong>Nothing here yet</strong><span>Say hello. It can be anything.</span></div> : messages.map((message) => <article key={message.id} className={message.sender === role ? 'mine' : 'theirs'}><div><div className={`bubble ${message.sender}`}>{message.content}</div><time>{new Date(message.created_at).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}</time></div><button type="button" className="delete-message" onClick={() => void deleteMessage(message.id)} aria-label="Delete message" title="Delete message">×</button></article>)}
       <div ref={bottomRef} />
     </section>
     {error && <div className="error" role="alert">{error}</div>}
@@ -161,34 +119,19 @@ function Chat({ role, onBack }: { role: Role; onBack: () => void }) {
 export default function Home() {
   const [role, setRole] = useState<Role | null>(null);
   const [counts, setCounts] = useState({ her: 0, him: 0 });
-
   useEffect(() => {
-    let alive = true;
-    let channel: ReturnType<typeof supabase.channel> | null = null;
-
+    let alive = true; let channel: ReturnType<typeof supabase.channel> | null = null;
     async function loadUnreadCounts() {
       if (!isSupabaseConfigured()) return;
       try {
-        const roomId = await getRoomId();
-        if (!roomId || !alive) return;
-        const next = await getUnreadCounts(roomId);
-        if (alive) setCounts(next);
-
-        channel = supabase.channel(`just-us-unread-${roomId}`)
-          .on('postgres_changes', { event: '*', schema: 'public', table: 'messages', filter: `room_id=eq.${roomId}` }, async () => {
-            try {
-              const latest = await getUnreadCounts(roomId);
-              if (alive) setCounts(latest);
-            } catch { /* Chat view shows operational errors; badge refresh is best-effort. */ }
-          })
-          .subscribe();
-      } catch { /* The entry screen stays usable if Supabase is temporarily unavailable. */ }
+        const roomId = await getRoomId(); if (!roomId || !alive) return;
+        const next = await getUnreadCounts(roomId); if (alive) setCounts(next);
+        channel = supabase.channel(`just-us-unread-${roomId}`).on('postgres_changes', { event: '*', schema: 'public', table: 'messages', filter: `room_id=eq.${roomId}` }, async () => { try { const latest = await getUnreadCounts(roomId); if (alive) setCounts(latest); } catch {} }).subscribe();
+      } catch {}
     }
-
     void loadUnreadCounts();
     return () => { alive = false; if (channel) void supabase.removeChannel(channel); };
-  }, [role]);
-
+  }, []);
   if (role) return <Chat role={role} onBack={() => setRole(null)} />;
   return <main className="entry"><section className="entry-card"><div className="eyebrow">JUST US</div><h1>A little place for us ❤️</h1><p>our little corner of the internet</p><div className="role-buttons"><button type="button" className="role her" onClick={() => setRole('her')}>I'M HER 🟢{counts.her > 0 && <small>{counts.her} new</small>}</button><button type="button" className="role him" onClick={() => setRole('him')}>I'M HIM 🔵{counts.him > 0 && <small>{counts.him} new</small>}</button></div></section></main>;
 }
