@@ -46,12 +46,8 @@ function Chat({ role, onBack }: { role: Role; onBack: () => void }) {
         if (!alive) return;
         if (typeof id !== 'string') { setError('The Just Us chat room was not found.'); setLoading(false); return; }
         setRoomId(id);
-
-        // IMPORTANT: cleanup happens only when this chat is opened.
-        // A message marked seen during the current visit is never deleted here.
         const { error: cleanupError } = await supabase.rpc('cleanup_seen_messages', { p_room_id: id });
         if (cleanupError) throw cleanupError;
-
         const { data, error: messagesError } = await supabase.from('messages').select('*').eq('room_id', id).order('created_at', { ascending: true });
         if (!alive) return;
         if (messagesError) setError(messagesError.message); else setMessages((data ?? []) as Message[]);
@@ -81,8 +77,6 @@ function Chat({ role, onBack }: { role: Role; onBack: () => void }) {
       const { error: seenError } = await supabase.rpc('mark_seen', { p_message_ids: unseenIds, p_viewer: role });
       if (cancelled) return;
       if (seenError) { setError(`Seen update failed: ${seenError.message}`); return; }
-      // Do not delete or remove anything here. The message stays visible for this visit.
-      // Realtime UPDATE will update the seen flags. Refresh is only a fallback for stale clients.
       await refreshMessages(currentRoomId);
     }
     void markSeenOnly();
@@ -133,7 +127,11 @@ function Chat({ role, onBack }: { role: Role; onBack: () => void }) {
 
 export default function Home() {
   const [role, setRole] = useState<Role | null>(null);
+  const [name, setName] = useState('');
   const [counts, setCounts] = useState({ her: 0, him: 0 });
+  const normalized = name.trim().toLowerCase();
+  const matchedRole: Role | null = normalized === 'aarna' ? 'her' : normalized === 'akshat' ? 'him' : null;
+
   useEffect(() => {
     let alive = true; let channel: ReturnType<typeof supabase.channel> | null = null;
     async function loadUnreadCounts() {
@@ -147,8 +145,16 @@ export default function Home() {
     void loadUnreadCounts();
     return () => { alive = false; if (channel) void supabase.removeChannel(channel); };
   }, []);
-  if (role) return <Chat role={role} onBack={() => setRole(null)} />;
+
+  useEffect(() => {
+    if (matchedRole) {
+      const timer = window.setTimeout(() => setRole(matchedRole), 250);
+      return () => window.clearTimeout(timer);
+    }
+  }, [matchedRole]);
+
+  if (role) return <Chat role={role} onBack={() => { setRole(null); setName(''); }} />;
   return (
-    <main className="entry"><section className="entry-card"><div className="eyebrow">JUST US</div><h1>A little place for us ❤️</h1><p>our little corner of the internet</p><div className="role-buttons"><button type="button" className="role her" onClick={() => setRole('her')}>I'M HER 🟢{counts.her > 0 && <small>{counts.her} new</small>}</button><button type="button" className="role him" onClick={() => setRole('him')}>I'M HIM 🔵{counts.him > 0 && <small>{counts.him} new</small>}</button></div></section></main>
+    <main className="entry"><section className="entry-card"><div className="eyebrow">JUST US</div><h1>A little place for us ❤️</h1><p>Type your name to enter.</p><input className="name-entry" autoFocus value={name} onChange={(e) => setName(e.target.value)} placeholder="Type your name…" autoComplete="off" aria-label="Your name"/><div className="role-buttons"><button type="button" className="role her" onClick={() => setRole('her')}>I'M HER 🟢{counts.her > 0 && <small>{counts.her} new</small>}</button><button type="button" className="role him" onClick={() => setRole('him')}>I'M HIM 🔵{counts.him > 0 && <small>{counts.him} new</small>}</button></div>{name.trim() && !matchedRole && <small style={{display:'block',marginTop:12,opacity:.65}}>Name not recognized</small>}{matchedRole && <small style={{display:'block',marginTop:12,opacity:.65}}>Opening {matchedRole === 'her' ? 'her' : 'his'} space…</small>}</section></main>
   );
 }
