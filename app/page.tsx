@@ -47,8 +47,8 @@ function Chat({ role, onBack }: { role: Role; onBack: () => void }) {
         if (typeof id !== 'string') { setError('The Just Us chat room was not found.'); setLoading(false); return; }
         setRoomId(id);
 
-        // Messages that were already seen by both people are removed only when
-        // the chat is opened again, not immediately after the first view.
+        // IMPORTANT: cleanup happens only when this chat is opened.
+        // A message marked seen during the current visit is never deleted here.
         const { error: cleanupError } = await supabase.rpc('cleanup_seen_messages', { p_room_id: id });
         if (cleanupError) throw cleanupError;
 
@@ -77,13 +77,15 @@ function Chat({ role, onBack }: { role: Role; onBack: () => void }) {
     const unseenIds = messages.filter((message) => message.sender !== role && (role === 'her' ? !message.her_seen : !message.him_seen)).map((message) => message.id);
     if (!unseenIds.length) return;
     let cancelled = false;
-    async function markAndRefresh() {
+    async function markSeenOnly() {
       const { error: seenError } = await supabase.rpc('mark_seen', { p_message_ids: unseenIds, p_viewer: role });
       if (cancelled) return;
       if (seenError) { setError(`Seen update failed: ${seenError.message}`); return; }
+      // Do not delete or remove anything here. The message stays visible for this visit.
+      // Realtime UPDATE will update the seen flags. Refresh is only a fallback for stale clients.
       await refreshMessages(currentRoomId);
     }
-    void markAndRefresh();
+    void markSeenOnly();
     return () => { cancelled = true; };
   }, [messages, role, roomId]);
 
