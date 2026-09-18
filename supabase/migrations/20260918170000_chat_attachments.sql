@@ -1,6 +1,9 @@
 -- Just Us: chat attachments (photos + common files)
 -- Run this migration in the same Supabase project used by the app.
 
+alter table public.messages drop constraint if exists messages_content_check;
+alter table public.messages add constraint messages_content_check check (char_length(trim(content)) between 0 and 4000);
+
 alter table public.messages
   add column if not exists attachment_url text,
   add column if not exists attachment_name text,
